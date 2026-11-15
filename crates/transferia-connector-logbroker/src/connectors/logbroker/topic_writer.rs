@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -258,19 +259,54 @@ fn compress(codec: TopicCodec, payload: Vec<u8>) -> anyhow::Result<EncodedMessag
     })
 }
 
-/// Compression runs off the async executor; RAW passes the payloads through.
-async fn encode(codec: TopicCodec, messages: Vec<Vec<u8>>) -> anyhow::Result<Vec<EncodedMessage>> {
-    let encode_all = move || {
-        messages
+type Payloads = Mutex<Option<Vec<Vec<u8>>>>;
+
+fn take_payloads(payloads: &Payloads) -> Vec<Vec<u8>> {
+    payloads
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
+
+/// Takes the payloads of a compression job back when the write that waits for
+/// it is cancelled, so a job still queued on the blocking pool holds nothing.
+struct Reclaim(Arc<Payloads>);
+
+impl Drop for Reclaim {
+    fn drop(&mut self) {
+        drop(take_payloads(&self.0));
+    }
+}
+
+fn spawn_compression(
+    codec: TopicCodec,
+    messages: Vec<Vec<u8>>,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<Vec<EncodedMessage>>>,
+    Reclaim,
+) {
+    let payloads = Arc::new(Mutex::new(Some(messages)));
+    let reclaim = Reclaim(Arc::clone(&payloads));
+    let job = tokio::task::spawn_blocking(move || {
+        take_payloads(&payloads)
             .into_iter()
             .map(|payload| compress(codec, payload))
-            .collect::<anyhow::Result<Vec<_>>>()
-    };
+            .collect()
+    });
+    (job, reclaim)
+}
+
+/// Compression runs off the async executor; RAW passes the payloads through.
+async fn encode(codec: TopicCodec, messages: Vec<Vec<u8>>) -> anyhow::Result<Vec<EncodedMessage>> {
     if codec == TopicCodec::Raw {
-        return encode_all();
+        return messages
+            .into_iter()
+            .map(|payload| compress(codec, payload))
+            .collect();
     }
-    tokio::task::spawn_blocking(encode_all)
-        .await
+    let (job, _reclaim) = spawn_compression(codec, messages);
+    job.await
         .map_err(|error| anyhow::anyhow!("YDB Topic message compression task failed: {error}"))?
 }
 

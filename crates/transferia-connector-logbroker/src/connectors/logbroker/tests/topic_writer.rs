@@ -3,9 +3,29 @@ use std::io::Read as _;
 use prost::Message as _;
 
 use super::{
-    compress, request_message_count, write_message, EncodedMessage, TopicCodec,
+    compress, request_message_count, spawn_compression, write_message, EncodedMessage, TopicCodec,
     MESSAGE_OVERHEAD_BYTES, WRITE_REQUEST_BUDGET,
 };
+
+#[test]
+fn cancelled_compression_gives_its_payloads_back_before_the_job_runs() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()?;
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    runtime.block_on(async {
+        // The only blocking thread is busy, so the compression job stays queued.
+        let busy = tokio::task::spawn_blocking(move || blocked.recv());
+        let (job, reclaim) = spawn_compression(TopicCodec::Gzip, vec![b"record\n".to_vec()]);
+
+        drop(reclaim);
+        release.send(())?;
+
+        busy.await??;
+        assert!(job.await??.is_empty());
+        Ok(())
+    })
+}
 
 #[test]
 fn every_codec_keeps_the_payload_and_its_size() -> anyhow::Result<()> {

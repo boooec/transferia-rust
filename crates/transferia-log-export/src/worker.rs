@@ -370,11 +370,12 @@ impl Worker {
         }
         let mut remaining = batch.records.len();
         let mut bytes = batch.bytes;
-        while let Some(record) = self
-            .carried
-            .take()
-            .or_else(|| self.receiver.try_recv().ok())
-        {
+        if let Some(record) = self.carried.take() {
+            remaining = remaining.saturating_add(1);
+            bytes = bytes.saturating_add(record.len());
+        }
+        // After `close`, `recv` ends only when no sender is still publishing a record.
+        while let Some(record) = self.receiver.recv().await {
             remaining = remaining.saturating_add(1);
             bytes = bytes.saturating_add(record.len());
         }

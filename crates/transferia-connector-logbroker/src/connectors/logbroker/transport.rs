@@ -47,7 +47,7 @@ pub async fn connect_http2_prior_knowledge(
     timeout: core::time::Duration,
     cancellation: &CancellationToken,
 ) -> anyhow::Result<H2Service> {
-    let address = socket_address(uri);
+    let address = socket_address(uri)?;
     let operation = async {
         let stream = tokio::net::TcpStream::connect(&address)
             .await
@@ -105,9 +105,21 @@ pub fn set_ydb_request_metadata(
     Ok(())
 }
 
-fn socket_address(uri: &Uri) -> String {
-    crate::connectors::address::host_port(
-        uri.host().unwrap_or("localhost"),
+/// Address of a plaintext endpoint; a missing port is 2135, the native gRPC port of YDB.
+fn socket_address(uri: &Uri) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        uri.scheme_str() == Some("http"),
+        "HTTP/2 prior-knowledge endpoint must use the http scheme"
+    );
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow!("HTTP/2 prior-knowledge endpoint has no host"))?;
+    Ok(crate::connectors::address::host_port(
+        host,
         uri.port_u16().unwrap_or(2135),
-    )
+    ))
 }
+
+#[cfg(test)]
+#[path = "tests/transport.rs"]
+mod tests;
